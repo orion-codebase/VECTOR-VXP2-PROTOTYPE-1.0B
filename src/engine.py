@@ -7,6 +7,9 @@ with physics-based safety validation for turbofan engine sensor data.
 import os
 import joblib
 import numpy as np
+import tensorflow as tf
+from tensorflow.keras.models import Sequential, load_model
+from tensorflow.keras.layers import LSTM, Dense, Dropout
 
 
 class VectorInference:
@@ -23,26 +26,26 @@ class VectorInference:
 
     def __init__(self, model_path: str = None):
         """
-        Load the Random Forest model from disk.
-
-        Parameters
-        ----------
-        model_path : str, optional
-            Path to the serialised model file.
-            Defaults to ``models/rf_v1.pkl`` relative to the project root.
+        Initialize the inference engine. Supports .pkl (Random Forest) 
+        and .h5 (Deep Learning LSTM) models.
         """
         if model_path is None:
             base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            model_path = os.path.join(base_dir, "models", "rf_v1.pkl")
+            # Default to LSTM if it exists, otherwise fallback to RF
+            lstm_path = os.path.join(base_dir, "models", "vxp2_lstm_v1.h5")
+            rf_path = os.path.join(base_dir, "models", "rf_v1.pkl")
+            model_path = lstm_path if os.path.exists(lstm_path) else rf_path
 
         if not os.path.exists(model_path):
-            raise FileNotFoundError(
-                f"Model file not found at '{model_path}'. "
-                "Please place the trained Random Forest model in the /models directory."
-            )
+            raise FileNotFoundError(f"Model file not found at '{model_path}'")
 
-        self.model = joblib.load(model_path)
         self.model_path = model_path
+        self.is_lstm = model_path.endswith('.h5')
+        
+        if self.is_lstm:
+            self.model = load_model(model_path)
+        else:
+            self.model = joblib.load(model_path)
 
     # ------------------------------------------------------------------ #
     #  Physics-based validation                                          #
@@ -51,18 +54,6 @@ class VectorInference:
         """
         Validate that the P30 / T30 ratio falls within the expected
         compressor pressure-temperature relationship.
-
-        Parameters
-        ----------
-        sensor_data : dict
-            Must contain keys ``'P30'`` (total pressure at HPC outlet, psi)
-            and ``'T30'`` (total temperature at HPC outlet, °R).
-
-        Returns
-        -------
-        tuple[bool, str]
-            ``(is_valid, message)`` where *is_valid* is True when the ratio
-            is physically plausible.
         """
         sensor_data = {str(k).lower(): v for k, v in sensor_data.items()}
         p30 = sensor_data.get("p30")
@@ -78,46 +69,58 @@ class VectorInference:
         within_bounds = self.P30_T30_RATIO_LOW <= ratio <= self.P30_T30_RATIO_HIGH
 
         if within_bounds:
-            message = (
-                f"P30/T30 ratio ({ratio:.4f}) is within expected bounds "
-                f"[{self.P30_T30_RATIO_LOW}, {self.P30_T30_RATIO_HIGH}]. "
-                "Compressor readings are physically consistent."
-            )
+            message = f"P30/T30 ratio ({ratio:.4f}) within expected bounds. Compressor nominal."
         else:
-            message = (
-                f"⚠ P30/T30 ratio ({ratio:.4f}) is OUTSIDE expected bounds "
-                f"[{self.P30_T30_RATIO_LOW}, {self.P30_T30_RATIO_HIGH}]. "
-                "Possible sensor fault or compressor anomaly detected."
-            )
+            message = f"⚠ P30/T30 ratio ({ratio:.4f}) OUTSIDE expected bounds. Sensor anomaly detected."
 
         return within_bounds, message
 
-    # ------------------------------------------------------------------ #
-    #  Health prediction                                                  #
-    # ------------------------------------------------------------------ #
-    def predict_rul(self, data_row: dict) -> float:
+    def predict_rul(self, data_row: dict, history: list = None) -> float:
         """
-        Predict Remaining Useful Life for a single data row.
-
-        Parameters
-        ----------
-        data_row : dict
-            A dictionary of feature values expected by the Random Forest
-            model.
-
-        Returns
-        -------
-        float
-            Predicted RUL in cycles.
+        Predict Remaining Useful Life. 
+        If LSTM is active, it uses the provided history (last 50 cycles).
         """
+        # 1. Standardize column names
         data_row = {str(k).lower(): v for k, v in data_row.items()}
         
-        feature_values = []
+        # 2. Extract features (s1 - s21)
+        current_features = []
         for i in range(1, 22):
-            sensor_key = f"s{i}"
-            val = data_row.get(sensor_key, 1500.0)
-            feature_values.append(val)
+            val = data_row.get(f"s{i}", 0.0)
+            current_features.append(val)
+        
+        if self.is_lstm:
+            # Deep Learning Path: Requires 50-cycle window
+            window_size = 50
+            if history and len(history) >= window_size:
+                # Use actual history
+                seq = []
+                for h_row in history[-window_size:]:
+                    h_row = {str(k).lower(): v for k, v in h_row.items()}
+                    seq.append([h_row.get(f"s{i}", 0.0) for i in range(1, 22)])
+                input_data = np.array([seq])
+            else:
+                # Pad with current row if history is insufficient
+                seq = [current_features] * window_size
+                input_data = np.array([seq])
             
-        feature_array = np.array(feature_values, dtype=np.float64).reshape(1, -1)
-        rul_prediction = float(self.model.predict(feature_array)[0])
-        return round(rul_prediction, 2)
+            prediction = self.model.predict(input_data, verbose=0)
+            rul_val = float(prediction[0][0])
+        else:
+            # Legacy RF Path
+            feature_array = np.array(current_features).reshape(1, -1)
+            rul_val = float(self.model.predict(feature_array)[0])
+            
+        return round(max(0, rul_val), 2)
+
+class VectorLSTM:
+    """Blueprint for the Vector Deep Learning Architecture."""
+    def __init__(self, window_size=50, feature_count=21):
+        self.model = Sequential([
+            LSTM(units=100, return_sequences=True, input_shape=(window_size, feature_count)),
+            Dropout(0.2),
+            LSTM(units=50, return_sequences=False),
+            Dropout(0.2),
+            Dense(units=1)
+        ])
+        self.model.compile(optimizer='adam', loss='mse')
