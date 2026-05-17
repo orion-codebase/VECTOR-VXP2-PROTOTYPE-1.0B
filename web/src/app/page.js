@@ -102,7 +102,7 @@ export default function Home() {
       if (res.risk_level === 'CRITICAL' && !res.is_valid) {
         setAlerts(prev => {
           const newAlert = {
-            id: `alert-${idx}-${Date.now()}`,
+            id: crypto.randomUUID(),
             type: 'CRITICAL',
             msg: res.message,
             cycle: row.cycle
